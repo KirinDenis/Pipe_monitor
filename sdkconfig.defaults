@@ -1,0 +1,45 @@
+# ============================================================
+# sdkconfig.defaults — pipe_monitor
+# Apply with: idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.defaults
+# ============================================================
+
+# ----------------------------------------------------------
+# CPU frequency: 80 MHz (vs 160 MHz default)
+# Halves dynamic power consumption during active phase.
+# DHT11 driver adjusts its cycle counts accordingly (CPU_MHZ=80).
+# ----------------------------------------------------------
+CONFIG_ESP8266_DEFAULT_CPU_FREQ_80=y
+
+# ----------------------------------------------------------
+# Disable WiFi completely at compile-time.
+# Removes the WiFi task and prevents any accidental RF activity.
+# ----------------------------------------------------------
+CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_ESP8266_WIFI_ENABLED=n
+
+# ----------------------------------------------------------
+# Disable Bluetooth (not present on ESP8266, but be explicit)
+# ----------------------------------------------------------
+CONFIG_BT_ENABLED=n
+
+# ----------------------------------------------------------
+# SPIFFS partition size.
+# log.csv: 2016 records × ~12 bytes = ~25 KB
+# counter.txt: ~10 bytes
+# Total: ~26 KB — use 64 KB partition for comfortable headroom.
+# Adjust partition table (partitions.csv) to match.
+# ----------------------------------------------------------
+CONFIG_SPIFFS_MAX_PARTITION_SIZE=65536
+
+# ----------------------------------------------------------
+# Log level: INFO in production (reduces UART overhead).
+# Change to DEBUG during development to see raw DHT bytes.
+# ----------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ----------------------------------------------------------
+# Deep sleep: allow power-down of XTAL during sleep.
+# Reduces sleep current from ~900 µA to ~20 µA.
+# ----------------------------------------------------------
+CONFIG_ESP8266_SLEEP_FULL_MODEM_SLEEP=y
+CONFIG_PM_ENABLE=y
