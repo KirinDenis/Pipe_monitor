@@ -1,33 +1,43 @@
 /**
  * @file main.c
- * @brief Hot water pipe temperature monitor for ESP8266 (ESP-IDF)
+ * @brief Hot-water pipe temperature monitor — ESP32, ESP-IDF v5.5
  *
- * Hardware:
- *   - ESP8266 module (NodeMCU or bare module)
- *   - DHT11 temperature sensor on GPIO4 (4.7kΩ pull-up to 3.3V required)
- *   - Red LED on GPIO12 (330Ω series resistor to GND)
- *   - Active buzzer on GPIO14 (active buzzer = buzzes when 3.3V applied)
- *   - GPIO16 MUST be connected to RST for deep sleep wake-up to work!
- *   - Power: 9V "Krona" → AMS1117-3.3 LDO → 3.3V rail
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │ HARDWARE                                                        │
+ * │   ESP32 DevKit (any variant)                                    │
+ * │   DHT11 on GPIO4  (4.7 kΩ pull-up to 3.3V required)           │
+ * │   Red LED on GPIO2 (330 Ω to GND; GPIO2 = built-in LED)       │
+ * │   Active buzzer on GPIO15 (+ to GPIO, − to GND)               │
+ * │   Power: 9V Krona → AMS1117-3.3 LDO → 3.3V                   │
+ * │                                                                 │
+ * │   NOTE: ESP32 does NOT need GPIO16→RST for deep sleep!        │
+ * │   The RTC timer wakes the chip internally. Much simpler.       │
+ * └─────────────────────────────────────────────────────────────────┘
  *
- * Power budget (rough):
- *   Deep sleep current:    ~20 µA
- *   Active time:           ~80 mA for ~3 seconds per wake
- *   Average per 5-min cycle: ≈ 0.02 + (80 * 3/300) ≈ 0.82 mA mean
- *   Krona (500 mAh) lifetime: ≈ 500/0.82 ≈ 600 hours ≈ 25 days
- *   (real-world less due to LDO quiescent current and file-write spikes)
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │ POWER BUDGET (rough)                                            │
+ * │   Deep sleep:  ~10 µA (ESP32 ULP + RTC running)                │
+ * │   Active:      ~80 mA for ~3 s per 5-min wake                  │
+ * │   Average:     0.010 + (80 × 3/300) ≈ 0.81 mA                 │
+ * │   Krona 500 mAh → ~600 h ≈ 25 days                            │
+ * │   (AMS1117 quiescent ~5 mA dominates; use MCP1700 for longer)  │
+ * └─────────────────────────────────────────────────────────────────┘
  *
- * Algorithm (see evaluate_pipe_hot() for full explanation):
- *   Collects up to 7 days of 5-minute readings.
- *   Declares pipe "hot" when current temperature exceeds the 75th
- *   percentile of historical readings AND is above 40°C absolute floor.
- *   This self-calibrates to the specific building's water temperature range.
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │ ALGORITHM (see evaluate_pipe_hot() for full explanation)        │
+ * │   • Reads temperature every 5 min; stores in SPIFFS CSV log    │
+ * │   • Keeps 7 days of history (2016 records max, circular)       │
+ * │   • Computes 75th percentile of all past readings              │
+ * │   • Pipe is "hot" if current temp ≥ P75 AND ≥ 40°C            │
+ * │   • Self-calibrates: works for any building's temp range       │
+ * └─────────────────────────────────────────────────────────────────┘
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -37,19 +47,14 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
-
-#include "driver/gpio.h"
-
 #include "esp_spiffs.h"
 #include "esp_vfs.h"
+#include "driver/gpio.h"
 
 #include "dht.h"
 #include "config.h"
 
 static const char *TAG = "pipe_monitor";
-
-/* Deep sleep duration: 5 minutes in microseconds */
-#define SLEEP_DURATION_US  (5ULL * 60ULL * 1000000ULL)
 
 /* =========================================================================
  * Forward declarations
@@ -57,129 +62,137 @@ static const char *TAG = "pipe_monitor";
 static void      disable_wifi(void);
 static esp_err_t init_spiffs(void);
 static uint32_t  read_counter(void);
-static void      write_counter(uint32_t counter);
+static void      write_counter(uint32_t v);
 static void      append_record(uint32_t counter, float temp);
-static int       load_history(float *out_temps, uint32_t *out_counters, int max_records);
-static bool      evaluate_pipe_hot(float current_temp, float *history, int history_len);
+static int       load_history(float *temps, uint32_t *counters, int max);
+static bool      evaluate_pipe_hot(float current, float *history, int len);
 static void      led_on(void);
 static void      led_off(void);
 static void      buzzer_beep(int times, int on_ms, int off_ms);
 static void      go_to_deep_sleep(void);
 
 /* =========================================================================
- * ENTRY POINT — called on every boot (including wake from deep sleep)
+ * app_main — called on every boot (including wake from deep sleep)
  * ========================================================================= */
 void app_main(void)
 {
     /* ------------------------------------------------------------------
-     * 1. NVS init (required by WiFi subsystem even when we disable it)
+     * 1. NVS — required by WiFi subsystem internals even when disabled
      * ------------------------------------------------------------------ */
     ESP_ERROR_CHECK(nvs_flash_init());
 
     /* ------------------------------------------------------------------
-     * 2. Kill WiFi radio immediately.
-     *    This is the biggest single power saving: WiFi RF block draws
-     *    ~80 mA when active. We must suppress it before it auto-starts.
+     * 2. Disable WiFi immediately — biggest single power saving.
+     *    ESP32 WiFi draws 100–250 mA when active. Kill it before it
+     *    auto-starts from NVS settings.
      * ------------------------------------------------------------------ */
     disable_wifi();
 
     /* ------------------------------------------------------------------
-     * 3. Configure GPIO outputs
+     * 3. Configure output GPIOs (LED + buzzer)
      * ------------------------------------------------------------------ */
-    gpio_config_t io_conf = {
+    const gpio_config_t out_cfg = {
         .pin_bit_mask = (1ULL << PIN_LED) | (1ULL << PIN_BUZZER),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io_conf);
-    /* Ensure outputs start LOW (LED off, buzzer silent) */
+    ESP_ERROR_CHECK(gpio_config(&out_cfg));
     gpio_set_level(PIN_LED,    0);
     gpio_set_level(PIN_BUZZER, 0);
 
     /* ------------------------------------------------------------------
-     * 4. Mount SPIFFS filesystem
-     *    If mount fails we can't log data, so just go back to sleep.
+     * 4. Mount SPIFFS
      * ------------------------------------------------------------------ */
     if (init_spiffs() != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS failed — sleeping");
+        ESP_LOGE(TAG, "SPIFFS failed — going back to sleep");
         go_to_deep_sleep();
-        return; /* unreachable, keeps compiler happy */
+        return;
     }
 
     /* ------------------------------------------------------------------
      * 5. Increment persistent wake counter
      *
-     *    WHY: Deep sleep resets the CPU; there is no monotonic clock that
-     *    survives across sleep cycles in ESP8266 (RTC memory is cleared on
-     *    some reset types). We keep a simple counter in a file instead.
-     *    This counter lets us reconstruct the time axis of the log after
-     *    downloading the CSV: record_time = counter * 5_minutes.
+     *    WHY: Deep sleep fully reboots the CPU — there is no running clock.
+     *    We store a counter in a file. Each wake increments it by 1.
+     *    Knowing the counter and deployment time lets you reconstruct when
+     *    each reading was taken: time = deploy_time + counter × 5 min.
+     *    Also survives unexpected resets — you can always find the gap in
+     *    counter values and know a reset happened.
      * ------------------------------------------------------------------ */
-    uint32_t wake_counter = read_counter() + 1;
-    write_counter(wake_counter);
-    ESP_LOGI(TAG, "=== Wake #%lu ===", (unsigned long)wake_counter);
+    uint32_t wake_n = read_counter() + 1;
+    write_counter(wake_n);
+    ESP_LOGI(TAG, "=== Wake #%"PRIu32" ===", wake_n);
 
     /* ------------------------------------------------------------------
-     * 6. Wait for DHT11 to stabilise, then read temperature
+     * 6. Wait for DHT11 to stabilise, then read
      *
-     *    DHT11 performs its first measurement 1 second after power-on.
-     *    After deep sleep the chip fully reboots, so we always wait.
-     *    Using 1200 ms gives comfortable margin for the 1 s requirement.
+     *    DHT11 performs its first internal measurement 1 s after power-on.
+     *    After deep sleep ESP32 cold-boots, so we always wait.
      * ------------------------------------------------------------------ */
     vTaskDelay(pdMS_TO_TICKS(DHT_STABILISE_MS));
 
     float temperature = NAN;
     float humidity    = NAN;
-    esp_err_t dht_err = dht_read_float_data(DHT_TYPE_DHT11, PIN_DHT,
+
+    /* Retry up to 3 times — DHT11 occasionally misfires on first read */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        esp_err_t err = dht_read_float_data(DHT_TYPE_DHT11, PIN_DHT,
                                              &humidity, &temperature);
-    if (dht_err != ESP_OK) {
-        ESP_LOGW(TAG, "DHT11 read error %d — will skip this sample", dht_err);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "DHT11: %.0f°C  RH %.0f%%", temperature, humidity);
+            break;
+        }
+        ESP_LOGW(TAG, "DHT11 read attempt %d failed: %s",
+                 attempt + 1, esp_err_to_name(err));
         temperature = NAN;
-    } else {
-        ESP_LOGI(TAG, "Sensor: %.0f°C  RH:%.0f%%", temperature, humidity);
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     /* ------------------------------------------------------------------
-     * 7. Append reading to circular log file (if read succeeded)
+     * 7. Append reading to circular CSV log
      * ------------------------------------------------------------------ */
     if (!isnan(temperature)) {
-        append_record(wake_counter, temperature);
+        append_record(wake_n, temperature);
+    } else {
+        ESP_LOGW(TAG, "Skipping log entry — no valid reading");
     }
 
     /* ------------------------------------------------------------------
      * 8. Load full history and evaluate pipe state
+     *
+     *    Declared static to avoid placing 2016-element arrays on the stack.
+     *    (ESP32 default stack for app_main is 3.5 KB — would overflow.)
      * ------------------------------------------------------------------ */
-    static float    history_temps[MAX_RECORDS];    /* static: avoid stack */
-    static uint32_t history_counters[MAX_RECORDS];
-
-    int history_len = load_history(history_temps, history_counters, MAX_RECORDS);
+    static float    hist_temps[MAX_RECORDS];
+    static uint32_t hist_counters[MAX_RECORDS];
+    int hist_len = load_history(hist_temps, hist_counters, MAX_RECORDS);
 
     bool pipe_is_hot = false;
+
     if (!isnan(temperature)) {
-        if (history_len < MIN_HISTORY_RECORDS) {
-            ESP_LOGI(TAG, "Collecting baseline: %d / %d records",
-                     history_len, MIN_HISTORY_RECORDS);
+        if (hist_len < MIN_HISTORY_RECORDS) {
+            ESP_LOGI(TAG, "Building baseline: %d / %d records",
+                     hist_len, MIN_HISTORY_RECORDS);
         } else {
-            pipe_is_hot = evaluate_pipe_hot(temperature, history_temps, history_len);
+            pipe_is_hot = evaluate_pipe_hot(temperature, hist_temps, hist_len);
         }
     }
 
-    ESP_LOGI(TAG, "Decision: pipe is %s", pipe_is_hot ? "HOT ✓" : "cold ✗");
+    ESP_LOGI(TAG, "Result: pipe is %s", pipe_is_hot ? "HOT ✓" : "cold ✗");
 
     /* ------------------------------------------------------------------
-     * 9. Signal user via LED and buzzer
+     * 9. Signal user
      *
-     *    Sequence when HOT:
-     *      - Turn LED on
-     *      - Beep buzzer BUZZER_BEEP_COUNT times
-     *      - Keep LED on for LED_VISIBLE_MS so user can see it
-     *      - Turn LED off (it will also go off when we enter deep sleep)
+     *    Hot pipe sequence:
+     *      LED on → 5 beeps → LED stays on 3 s → LED off → sleep
      *
-     *    Note: we cannot keep the LED on *during* deep sleep without
-     *    external circuitry (e.g. a latch). For a battery device the
-     *    5-minute beep-on-wake is the primary notification mechanism.
+     *    Note on LED during deep sleep: GPIO state is NOT held during
+     *    deep sleep on ESP32 — the LED will go dark when we sleep.
+     *    The buzzer sequence is the primary user alert.
+     *    If you need LED to stay on across sleep cycles, you'd need
+     *    an external latch circuit — overkill for this project.
      * ------------------------------------------------------------------ */
     if (pipe_is_hot) {
         led_on();
@@ -189,14 +202,13 @@ void app_main(void)
     }
 
     /* ------------------------------------------------------------------
-     * 10. Cleanly unmount filesystem before sleep
-     *     This flushes pending writes and closes all open files.
+     * 10. Unmount SPIFFS — flushes write buffers before power-down
      * ------------------------------------------------------------------ */
     esp_vfs_spiffs_unregister(NULL);
 
     /* ------------------------------------------------------------------
-     * 11. Enter deep sleep for 5 minutes
-     *     Remember: GPIO16 must be connected to RST!
+     * 11. Deep sleep for 5 minutes
+     *     No external wiring needed — ESP32 RTC timer wakes chip internally
      * ------------------------------------------------------------------ */
     go_to_deep_sleep();
 }
@@ -205,18 +217,11 @@ void app_main(void)
  * WiFi
  * ========================================================================= */
 
-/**
- * @brief Disable WiFi modem completely to save power.
- *
- * On ESP8266, the WiFi/RF block can draw 60–170 mA when active.
- * Even in modem-sleep mode it periodically wakes. Setting WIFI_MODE_NULL
- * and calling esp_wifi_stop() ensures the radio is fully off.
- */
 static void disable_wifi(void)
 {
-    /* Stop may fail gracefully if WiFi was never started — that's fine */
+    /* These may return errors if WiFi was never initialised — that's fine */
     esp_wifi_stop();
-    esp_wifi_set_mode(WIFI_MODE_NULL);
+    esp_wifi_deinit();
     ESP_LOGI(TAG, "WiFi disabled");
 }
 
@@ -226,45 +231,46 @@ static void disable_wifi(void)
 
 static esp_err_t init_spiffs(void)
 {
-    esp_vfs_spiffs_conf_t conf = {
+    esp_vfs_spiffs_conf_t cfg = {
         .base_path              = "/spiffs",
-        .partition_label        = NULL,   /* first 'spiffs' partition in partition table */
+        .partition_label        = NULL,      /* uses first spiffs partition   */
         .max_files              = 5,
-        .format_if_mount_failed = true,   /* auto-format on first boot */
+        .format_if_mount_failed = true,      /* auto-format blank flash       */
     };
-    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    esp_err_t ret = esp_vfs_spiffs_register(&cfg);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS register: %s", esp_err_to_name(ret));
-    } else {
-        size_t total = 0, used = 0;
-        esp_spiffs_info(NULL, &total, &used);
-        ESP_LOGI(TAG, "SPIFFS: %d / %d bytes used", used, total);
+        ESP_LOGE(TAG, "SPIFFS: %s", esp_err_to_name(ret));
+        return ret;
     }
-    return ret;
+    size_t total = 0, used = 0;
+    esp_spiffs_info(NULL, &total, &used);
+    ESP_LOGI(TAG, "SPIFFS: %d / %d bytes", used, total);
+    return ESP_OK;
 }
 
 /* =========================================================================
- * Persistent wake counter
+ * Persistent counter
  *
- * File: /spiffs/counter.txt  — contains a single ASCII decimal number.
- * Stored as text so it can be read/reset via serial terminal if needed.
+ * File: /spiffs/counter.txt
+ * Format: single ASCII decimal number followed by newline.
+ * Stored as text so it can be read/edited via serial terminal if needed.
  * ========================================================================= */
 
 static uint32_t read_counter(void)
 {
     FILE *f = fopen("/spiffs/counter.txt", "r");
-    if (!f) return 0;  /* file missing = first boot */
-    uint32_t val = 0;
-    fscanf(f, "%lu", (unsigned long *)&val);
+    if (!f) return 0;   /* doesn't exist = first boot */
+    uint32_t v = 0;
+    fscanf(f, "%"SCNu32, &v);
     fclose(f);
-    return val;
+    return v;
 }
 
-static void write_counter(uint32_t counter)
+static void write_counter(uint32_t v)
 {
     FILE *f = fopen("/spiffs/counter.txt", "w");
     if (!f) { ESP_LOGE(TAG, "Cannot write counter.txt"); return; }
-    fprintf(f, "%lu\n", (unsigned long)counter);
+    fprintf(f, "%"PRIu32"\n", v);
     fclose(f);
 }
 
@@ -272,71 +278,33 @@ static void write_counter(uint32_t counter)
  * Circular temperature log
  *
  * File: /spiffs/log.csv
- * Format (one record per line):
- *   <wake_counter>,<temperature_celsius>\n
- *   e.g.:  1042,47.0
+ * Format: one record per line — "counter,temperature\n"
+ *   Example: 1042,47.0
  *
- * The file holds at most MAX_RECORDS lines (7 days × 288 samples/day).
- * When full, the oldest record is evicted. The counter field lets you
- * determine the time of each record when downloading the log:
- *   UTC_time = deployment_start + counter * 5_minutes
+ * The file is kept at most MAX_RECORDS lines (one week at 5-min interval).
+ * When full, the oldest record is dropped and the file is rewritten.
  *
- * Implementation note: we load the entire file into RAM, modify, rewrite.
- * With 2016 lines of ~12 bytes each the file is ~24 KB — fits in ESP8266 RAM.
+ * Memory note: 2016 lines × 14 bytes ≈ 28 KB on SPIFFS; arrays in RAM
+ * ≈ 2016 × (4+4) bytes = 16 KB. ESP32 has 320 KB RAM, so no problem.
  * ========================================================================= */
 
 /**
- * @brief Append one reading; evict oldest if buffer is full.
- */
-static void append_record(uint32_t counter, float temp)
-{
-    /* Load existing data */
-    static float    temps[MAX_RECORDS];
-    static uint32_t counters[MAX_RECORDS];
-    int n = load_history(temps, counters, MAX_RECORDS);
-
-    /* Evict oldest record when full (circular buffer behaviour) */
-    if (n >= MAX_RECORDS) {
-        /* Shift array left by 1: index 0 (oldest) is discarded */
-        memmove(temps,    temps    + 1, (MAX_RECORDS - 1) * sizeof(float));
-        memmove(counters, counters + 1, (MAX_RECORDS - 1) * sizeof(uint32_t));
-        n = MAX_RECORDS - 1;
-    }
-
-    /* Append newest record at the end */
-    counters[n] = counter;
-    temps[n]    = temp;
-    n++;
-
-    /* Rewrite the whole file */
-    FILE *f = fopen("/spiffs/log.csv", "w");
-    if (!f) { ESP_LOGE(TAG, "Cannot open log.csv for writing"); return; }
-
-    for (int i = 0; i < n; i++) {
-        fprintf(f, "%lu,%.1f\n", (unsigned long)counters[i], temps[i]);
-    }
-    fclose(f);
-    ESP_LOGI(TAG, "Log updated: %d records (oldest counter=%lu)",
-             n, (unsigned long)counters[0]);
-}
-
-/**
- * @brief Load all records from log file into caller-supplied arrays.
+ * @brief Load log file into caller-supplied arrays.
  * @return Number of records loaded (0 if file doesn't exist yet).
  */
-static int load_history(float *out_temps, uint32_t *out_counters, int max_records)
+static int load_history(float *temps, uint32_t *counters, int max)
 {
     FILE *f = fopen("/spiffs/log.csv", "r");
     if (!f) return 0;
 
-    int   n    = 0;
-    char  line[32];
-    while (fgets(line, sizeof(line), f) && n < max_records) {
-        unsigned long cnt;
-        float         t;
-        if (sscanf(line, "%lu,%f", &cnt, &t) == 2) {
-            out_counters[n] = (uint32_t)cnt;
-            out_temps[n]    = t;
+    int  n = 0;
+    char line[32];
+    while (fgets(line, sizeof(line), f) && n < max) {
+        uint32_t cnt;
+        float    t;
+        if (sscanf(line, "%"SCNu32",%f", &cnt, &t) == 2) {
+            counters[n] = cnt;
+            temps[n]    = t;
             n++;
         }
     }
@@ -344,98 +312,112 @@ static int load_history(float *out_temps, uint32_t *out_counters, int max_record
     return n;
 }
 
+/**
+ * @brief Append one record; evict oldest if buffer is full; rewrite file.
+ */
+static void append_record(uint32_t counter, float temp)
+{
+    static float    temps[MAX_RECORDS];
+    static uint32_t counters[MAX_RECORDS];
+    int n = load_history(temps, counters, MAX_RECORDS);
+
+    /* Circular buffer: discard oldest when full */
+    if (n >= MAX_RECORDS) {
+        /* Shift left — index 0 (oldest) is overwritten */
+        memmove(temps,    temps    + 1, (MAX_RECORDS - 1) * sizeof(float));
+        memmove(counters, counters + 1, (MAX_RECORDS - 1) * sizeof(uint32_t));
+        n = MAX_RECORDS - 1;
+    }
+
+    counters[n] = counter;
+    temps[n]    = temp;
+    n++;
+
+    /* Rewrite entire file */
+    FILE *f = fopen("/spiffs/log.csv", "w");
+    if (!f) { ESP_LOGE(TAG, "Cannot write log.csv"); return; }
+    for (int i = 0; i < n; i++) {
+        fprintf(f, "%"PRIu32",%.1f\n", counters[i], temps[i]);
+    }
+    fclose(f);
+    ESP_LOGI(TAG, "Log: %d records | oldest=%"PRIu32" newest=%"PRIu32,
+             n, counters[0], counters[n - 1]);
+}
+
 /* =========================================================================
- * CORE ALGORITHM
+ * CORE ALGORITHM — evaluate_pipe_hot()
  * =========================================================================
  *
- * GOAL: Tell the user when the hot water pipe is carrying genuinely hot
- * water worth using — without requiring any manual calibration.
- *
- * PROBLEM: "Hot" is relative. In Moscow buildings typical supply is 60°C;
- * in some Ukrainian buildings it may be 45°C; in summer after maintenance
- * it might be only 40°C. A fixed threshold would miss real use cases or
- * fire false positives.
+ * PROBLEM: "Hot" is relative to the building. In one house hot water is
+ * 45°C; in another it's 65°C. We cannot use a fixed threshold — it would
+ * either miss genuine delivery windows or fire false positives.
  *
  * SOLUTION — adaptive percentile threshold:
  *
- *   1. Sort the historical temperature readings (7 days, 5-min intervals).
- *   2. Find the P-th percentile value (default P = 75).
- *      → This is the temperature that was exceeded 25% of the time.
- *   3. Declare the pipe "hot" if:
- *        current_temp ≥ percentile_threshold - HYSTERESIS_C
+ *   1. Sort all historical temperature readings.
+ *   2. Find the HOT_PERCENTILE-th percentile (default: 75th).
+ *      → The temperature exceeded by only the top 25% of past readings.
+ *   3. Declare pipe "hot" if:
+ *        current_temp ≥ threshold − HYSTERESIS_C
  *        AND current_temp ≥ ABSOLUTE_MIN_HOT_C
  *
- * INTERPRETATION:
- *   The percentile self-calibrates to the building's actual distribution.
- *   If the pipe is cold 80% of the time (common in Russian multi-family
- *   housing: hot water is cut for maintenance or follows a schedule), the
- *   75th percentile threshold will sit at the temperature the pipe reaches
- *   only during genuine hot-water delivery windows. We catch exactly those
- *   moments.
+ * HOW IT SELF-CALIBRATES:
+ *   In a building where hot water runs only 4 hours/day (common in CIS
+ *   housing where water supply follows a schedule), the temperature
+ *   distribution is bimodal: ~20°C most of the time, ~55°C during delivery.
+ *   The 75th percentile naturally falls inside the hot cluster, so the
+ *   algorithm triggers exactly during delivery windows.
  *
- *   If hot water runs 24/7 (well-maintained building), the 75th percentile
- *   will be high (e.g. 60°C), so we only trigger on the truly hottest
- *   periods — still useful for "peak heat available" detection.
+ *   In a building with 24/7 hot water the 75th percentile sits near the
+ *   top of the normal operating range — still useful as a "peak heat"
+ *   indicator (e.g. freshly pumped vs re-circulated water).
  *
- * HYSTERESIS:
- *   Prevents the output from flickering when the temperature oscillates
- *   right around the threshold. Once hot, it stays "hot" until it drops
- *   more than HYSTERESIS_C below the threshold.
+ * HYSTERESIS prevents flickering when temperature oscillates near threshold.
  *
- * ABSOLUTE FLOOR:
- *   Even if the building had no hot water for 6 of the 7 days so the 75th
- *   percentile is 22°C, we still won't declare 23°C "hot". 40°C is the
- *   sanitary minimum for hot water supply in CIS countries.
+ * ABSOLUTE FLOOR prevents declaring a 22°C pipe "hot" just because the
+ * 75th percentile happens to be 21°C (building had no hot water all week).
  *
- * STARTUP:
- *   We require MIN_HISTORY_RECORDS (≥48, i.e. ≥4 hours) before the
- *   algorithm activates. This avoids the first-boot false positive where
- *   we have only 1 reading and 100% of history is "above the 75th pct".
+ * STARTUP GUARD: algorithm is silent for the first MIN_HISTORY_RECORDS
+ * readings to avoid false positives when we have too little data.
  * ========================================================================= */
 
-/** qsort comparator for float ascending sort */
-static int cmp_float_asc(const void *a, const void *b)
+/* qsort comparator — ascending float */
+static int cmp_float(const void *a, const void *b)
 {
     float fa = *(const float *)a;
     float fb = *(const float *)b;
     return (fa > fb) - (fa < fb);
 }
 
-/**
- * @brief Evaluate whether current temperature is "historically hot".
- *
- * @param current_temp  Current DHT11 reading in °C
- * @param history       Array of past readings (any order; we sort internally)
- * @param history_len   Number of valid elements in history[]
- * @return true if pipe is currently in a "hot" state
- */
-static bool evaluate_pipe_hot(float current_temp, float *history, int history_len)
+static bool evaluate_pipe_hot(float current, float *history, int len)
 {
-    /* ---- Hard floor ---- */
-    if (current_temp < ABSOLUTE_MIN_HOT_C) {
-        ESP_LOGI(TAG, "Below floor (%.0f°C < %.0f°C)", current_temp, ABSOLUTE_MIN_HOT_C);
+    /* Hard minimum — skip percentile math if clearly cold */
+    if (current < ABSOLUTE_MIN_HOT_C) {
+        ESP_LOGI(TAG, "Below floor: %.1f < %.1f°C", current, ABSOLUTE_MIN_HOT_C);
         return false;
     }
 
-    /* ---- Copy + sort ---- */
-    int   n      = (history_len < MAX_RECORDS) ? history_len : MAX_RECORDS;
-    float *sorted = malloc(n * sizeof(float));
+    /* Copy history into a temporary array and sort ascending */
+    int    n      = (len < MAX_RECORDS) ? len : MAX_RECORDS;
+    float *sorted = (float *)malloc(n * sizeof(float));
     if (!sorted) {
-        ESP_LOGE(TAG, "malloc failed in evaluate");
+        ESP_LOGE(TAG, "malloc failed — skipping evaluation");
         return false;
     }
     memcpy(sorted, history, n * sizeof(float));
-    qsort(sorted, n, sizeof(float), cmp_float_asc);
+    qsort(sorted, n, sizeof(float), cmp_float);
 
-    /* ---- Percentile by linear interpolation ----
+    /* Linear-interpolated percentile
      *
      * Index of the P-th percentile in a sorted array of length n:
-     *   idx = (P/100) * (n-1)
-     * e.g. P=75, n=100 → idx=74.25 → interpolate between sorted[74] and sorted[75]
+     *   idx = (P / 100) * (n - 1)
+     *
+     * Example: P=75, n=100 → idx=74.25
+     *   threshold = sorted[74] + 0.25 * (sorted[75] - sorted[74])
      */
-    float pidx  = (HOT_PERCENTILE / 100.0f) * (float)(n - 1);
-    int   lo    = (int)pidx;
-    float frac  = pidx - (float)lo;
+    float pidx     = (HOT_PERCENTILE / 100.0f) * (float)(n - 1);
+    int   lo       = (int)pidx;
+    float frac     = pidx - (float)lo;
     float threshold;
 
     if (lo + 1 < n) {
@@ -445,23 +427,23 @@ static bool evaluate_pipe_hot(float current_temp, float *history, int history_le
     }
     free(sorted);
 
-    ESP_LOGI(TAG, "P%.0f=%.1f°C | now=%.1f°C | hot if >=%.1f°C",
-             HOT_PERCENTILE, threshold, current_temp,
-             threshold - HYSTERESIS_C);
+    float effective_threshold = threshold - HYSTERESIS_C;
+    ESP_LOGI(TAG, "History %d pts | P%.0f = %.1f°C | hysteresis floor = %.1f°C | now = %.1f°C",
+             n, HOT_PERCENTILE, threshold, effective_threshold, current);
 
-    return (current_temp >= threshold - HYSTERESIS_C);
+    return (current >= effective_threshold);
 }
 
 /* =========================================================================
- * Output helpers
+ * GPIO output helpers
  * ========================================================================= */
 
 static void led_on(void)  { gpio_set_level(PIN_LED, 1); }
 static void led_off(void) { gpio_set_level(PIN_LED, 0); }
 
 /**
- * @brief Drive buzzer for @times short beeps.
- * @param times   How many beeps
+ * @brief Drive active buzzer for `times` beeps.
+ * @param times   Number of beeps
  * @param on_ms   Buzzer ON duration per beep (ms)
  * @param off_ms  Silence between beeps (ms)
  */
@@ -480,19 +462,16 @@ static void buzzer_beep(int times, int on_ms, int off_ms)
 /**
  * @brief Enter deep sleep for SLEEP_DURATION_US microseconds.
  *
- * HARDWARE NOTE: GPIO16 (D0 on NodeMCU) MUST be connected to the RST pin!
- * Without this wire, the RTC timer interrupt has nowhere to go and the
- * chip will sleep forever (until battery dies or manual reset).
- *
- * After wake the chip performs a full reset and app_main() runs again.
- * There is no "resume from sleep" — deep sleep is essentially a very
- * low-power reboot timer.
+ * ESP32 advantage over ESP8266: the RTC timer wakes the chip internally.
+ * No GPIO16→RST wire needed. After wake, the chip reboots and app_main()
+ * runs again from the top.
  */
 static void go_to_deep_sleep(void)
 {
-    ESP_LOGI(TAG, "Entering deep sleep for 5 min. GPIO16→RST required!");
-    /* Let UART transmit buffer flush */
-    vTaskDelay(pdMS_TO_TICKS(100));
-    esp_deep_sleep(SLEEP_DURATION_US);
-    /* never reached */
+    ESP_LOGI(TAG, "Entering deep sleep for 5 minutes...");
+    vTaskDelay(pdMS_TO_TICKS(100));     /* let UART flush log output */
+
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(SLEEP_DURATION_US));
+    esp_deep_sleep_start();
+    /* Never reached */
 }

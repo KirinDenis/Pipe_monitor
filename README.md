@@ -1,142 +1,143 @@
-# Pipe Temperature Monitor — ESP8266 / ESP-IDF
+# Pipe Temperature Monitor — ESP32 / ESP-IDF v5.5
 
 Monitors a hot-water supply pipe, stores 7 days of temperature history,
-and beeps + lights an LED when the pipe is carrying genuinely hot water
-(determined by adaptive percentile analysis of historical readings).
+and alerts (LED + buzzer) when the pipe is carrying genuinely hot water.
+Detection is adaptive — no manual calibration needed.
 
 ---
 
-## Hardware
+## Quick Start
 
-### Bill of Materials
-| Part | Notes |
-|------|-------|
-| ESP8266 module (NodeMCU v2/v3 or bare ESP-12) | Any variant works |
-| DHT11 sensor | 3-pin or 4-pin package |
-| 4.7 kΩ resistor | DHT11 data line pull-up |
-| 330 Ω resistor | LED current limiter |
-| Red LED (any 3 mm/5 mm) | |
-| Active buzzer 3–5 V | "Active" = buzzes at DC; simpler than passive |
-| 9V "Krona" battery | |
-| AMS1117-3.3 LDO regulator | Or any 3.3V LDO, 300 mA capable |
-| 10 µF + 100 nF capacitors | LDO bypass |
-
-### Wiring
-
-```
-                  3.3V
-                   │
-               [4.7kΩ]
-                   │
-DHT11 DATA ────────┤──── GPIO4  (D2 on NodeMCU)
-DHT11 VCC  ────────── 3.3V
-DHT11 GND  ────────── GND
-
-GPIO12 (D6) ──[330Ω]──>|── GND     (LED, anode to GPIO)
-
-GPIO14 (D5) ──────────[Buzzer+]    (active buzzer)
-                       [Buzzer-] ── GND
-
-!!! CRITICAL !!!
-GPIO16 (D0) ──────────── RST       (REQUIRED for deep sleep wake-up)
-Without this wire the chip sleeps forever!
-
-9V battery → LDO IN
-LDO OUT → 3.3V rail → ESP8266 VCC, DHT11 VCC
-LDO GND → GND rail
-```
-
-### Expected battery life (Krona 500 mAh)
-- Deep sleep current:   ~20 µA
-- Active time per wake: ~3 s @ ~80 mA
-- Average current:      ≈ 0.02 + (80 × 3 / 300) ≈ 0.82 mA
-- Estimated life:       500 / 0.82 ≈ **600 h ≈ 25 days**
-
-> Note: LDO quiescent current (~5 mA for AMS1117!) dominates in practice.
-> Use an MCP1700 or XC6206 LDO (2–4 µA Iq) for much longer battery life.
-> With a 4 µA LDO: avg ≈ 0.024 mA → ~20,000 h → impractical limit.
-
----
-
-## Software
-
-### Prerequisites
-- ESP8266 RTOS SDK (ESP-IDF style) installed
-- Python 3, idf.py in PATH
-
-### Build & Flash
 ```bash
+git clone / copy project folder
 cd pipe_monitor
-idf.py set-target esp8266
-idf.py -D SDKCONFIG_DEFAULTS=sdkconfig.defaults menuconfig
-# Verify: Component config → SPIFFS → partition size = 65536
-# Verify: CPU freq = 80 MHz
+
+idf.py set-target esp32
 idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+idf.py -p COM3 flash monitor     # Windows: COM3, Linux: /dev/ttyUSB0
 ```
 
-### File Structure
+---
+
+## Wiring
+
+```
+ESP32 DevKit
+                    3.3V
+                     │
+                 [4.7 kΩ]         ← pull-up REQUIRED for DHT11
+                     │
+DHT11 DATA ──────────┤──── GPIO4
+DHT11 VCC  ──────────────── 3.3V
+DHT11 GND  ──────────────── GND
+
+GPIO2  ──[330 Ω]──>|── GND        Red LED (anode to GPIO)
+                                  GPIO2 = built-in LED on most DevKits
+
+GPIO15 ──────────── Buzzer +      Active buzzer (buzzes at DC 3.3V)
+                    Buzzer − ──── GND
+
+9V Krona → LDO IN
+LDO 3.3V → ESP32 VIN, DHT11 VCC
+LDO GND  → GND
+
+Unlike ESP8266, ESP32 does NOT need GPIO16→RST for deep sleep!
+The RTC timer wakes the chip internally.
+```
+
+### LDO choice matters for battery life!
+
+| LDO | Quiescent current | Notes |
+|-----|-------------------|-------|
+| AMS1117-3.3 | ~5 mA | Common on DevKit boards; drains Krona in ~4 days |
+| MCP1700-3302 | 2 µA | Best choice for this project; ~25+ days |
+| XC6206P332 | 1 µA | Also excellent |
+
+If using a full DevKit board (not bare ESP32 module), the onboard AMS1117
+and USB-UART chip add ~10–20 mA quiescent draw. For long battery life,
+use a bare ESP32-WROOM module with MCP1700.
+
+---
+
+## Project Structure
+
 ```
 pipe_monitor/
-├── CMakeLists.txt
-├── partitions.csv
-├── sdkconfig.defaults
+├── CMakeLists.txt              ← top-level (required by IDF)
+├── partitions.csv              ← custom partition table with SPIFFS
+├── sdkconfig.defaults          ← CPU=80MHz, WiFi off, power management
 ├── main/
-│   ├── CMakeLists.txt
-│   ├── config.h          ← pins & algorithm constants
-│   └── main.c            ← main logic
+│   ├── CMakeLists.txt          ← registers main.c with build system
+│   ├── config.h                ← ALL tunable pins and constants
+│   └── main.c                  ← application logic
 └── components/
     └── dht/
         ├── CMakeLists.txt
         ├── dht.h
-        └── dht.c          ← DHT11 bit-bang driver
+        └── dht.c               ← DHT11/DHT22 bit-bang driver
 ```
 
 ---
 
 ## Algorithm
 
-The key question is: "Is the pipe **currently** hotter than usual?"
+### The problem with fixed thresholds
+
+If you hardcode `if (temp > 50°C) → hot`, this breaks across buildings:
+- Building A: hot water is 45°C → never triggers
+- Building B: hot water is 65°C → triggers even when pipe is lukewarm
+- Building with scheduled supply: cold 80% of day, hot 20% → threshold unclear
 
 ### Adaptive percentile threshold
 
-1. Every 5 minutes, temperature is appended to a circular log (7 days max).
-2. On each wake, sort all historical readings and compute the **75th percentile**.
-3. The pipe is declared **hot** if:
-   - `current_temp ≥ P75(history) − 1°C` (hysteresis)
-   - **AND** `current_temp ≥ 40°C` (sanitary minimum floor)
-4. If there are fewer than 48 historical readings (< 4 hours), the algorithm
-   waits silently to avoid false positives.
+Every 5 minutes:
+1. Read temperature, append to log (7-day circular buffer, 2016 entries max)
+2. Sort all historical readings
+3. Compute the **75th percentile** (P75) — temperature exceeded by top 25% of readings
+4. Declare pipe **hot** if:
+   - `current_temp ≥ P75 − 1°C` (1°C hysteresis to avoid flickering)
+   - **AND** `current_temp ≥ 40°C` (absolute sanitary minimum floor)
 
-### Why percentile and not a fixed threshold?
-Different buildings, different water temperatures. In one building "hot"
-is 45°C, in another it's 65°C. The percentile adapts automatically:
-if hot water flows 20% of the day, the 75th percentile sits right at the
-boundary between cold and hot — we catch every genuine delivery window
-regardless of the building's absolute temperature range.
+### Why this works
 
-### Tuning (config.h)
-| Constant | Default | Effect |
+In a building where hot water runs 3 hours/day, the temperature distribution
+is bimodal: ~20°C most of the day, ~55°C during delivery. The 75th percentile
+naturally falls at the beginning of the hot cluster — the algorithm fires
+exactly when hot water arrives, regardless of the absolute temperature.
+
+### Tuning (edit `config.h`)
+
+| Constant | Default | Effect if raised |
 |---|---|---|
-| `HOT_PERCENTILE` | 75.0 | Raise → stricter (only very hot triggers) |
-| `ABSOLUTE_MIN_HOT_C` | 40.0 | Raise if building always has ≥50°C water |
-| `HYSTERESIS_C` | 1.0 | Raise to reduce flicker near threshold |
-| `MIN_HISTORY_RECORDS` | 48 | Minimum baseline before algorithm activates |
+| `HOT_PERCENTILE` | 75.0 | Stricter — only very hot triggers |
+| `ABSOLUTE_MIN_HOT_C` | 40.0°C | Won't fire below this ever |
+| `HYSTERESIS_C` | 1.0°C | Reduces boundary flicker |
+| `MIN_HISTORY_RECORDS` | 48 (4 h) | Longer baseline before algorithm activates |
 
 ---
 
-## Data Recovery
+## Log File Format
 
-SPIFFS log format (`/spiffs/log.csv`):
+`/spiffs/log.csv` — readable via serial + SPIFFS tools:
 ```
-<wake_counter>,<temperature>\n
 1001,23.0
-1002,24.0
+1002,23.0
+1003,54.0
 ...
-2048,58.0
 ```
+`counter` field: monotonic wake counter. Survives resets — gaps in counter
+values indicate unexpected reboots. Time axis: `T = deploy_epoch + counter × 300s`
 
-To decode timestamps: `time = deploy_epoch + counter × 300 seconds`
+`/spiffs/counter.txt` — current counter value (plain text, editable).
 
-The counter file (`/spiffs/counter.txt`) persists across deep sleep reboots
-and lets you reconstruct the time axis even after partial data loss.
+---
+
+## Power Consumption Summary
+
+| State | Current | Duration |
+|---|---|---|
+| Deep sleep (ESP32 RTC only) | ~10 µA | ~298 s per cycle |
+| Active (CPU + DHT + SPIFFS) | ~80 mA | ~3 s per cycle |
+| Buzzer beeping | +30 mA | ~1.5 s total |
+| **Average (MCP1700 LDO)** | **~0.82 mA** | |
+| Krona 500 mAh estimated life | **~600 h / 25 days** | |

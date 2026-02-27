@@ -1,8 +1,0 @@
-# Partition table for pipe_monitor
-# ESP8266 flash: 1 MB (0x100000) typical on bare modules; 4 MB on NodeMCU
-#
-# Name,   Type, SubType,  Offset,   Size,    Flags
-nvs,      data, nvs,      0x9000,   0x6000,
-phy_init, data, phy,      0xf000,   0x1000,
-factory,  app,  factory,  0x10000,  0xE0000,   # 896 KB app
-spiffs,   data, spiffs,   0xF0000,  0x10000,   # 64 KB SPIFFS
