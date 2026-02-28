@@ -17,6 +17,21 @@ idf.py build
 idf.py -p COM3 flash monitor     # Windows: COM3, Linux: /dev/ttyUSB0
 ```
 
+### Please note that for a file partitions_custom.csv 
+with custom partitions, do not rename it to partitions.csv(used by default).
+Also, ESP-IDF can independently change the original sdkconfig file -> pay attention to these keys section:
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_custom.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_custom.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_PARTITION_TABLE_MD5=y
+
+they keys should be like this. In any case, this doesn't work for me if this file is named partitions.csv for ESP-IDF v5.5.
+you see this error at "Monitor Device":
+E (409) SPIFFS: spiffs partition could not be found
+E (409) pipe_monitor: SPIFFS: ESP_ERR_NOT_FOUND
+E (409) pipe_monitor: SPIFFS failed — going back to sleep
 ---
 
 ## Wiring
@@ -37,11 +52,11 @@ GPIO2  ──[330 Ω]──>|── GND        Red LED (anode to GPIO)
 GPIO15 ──────────── Buzzer +      Active buzzer (buzzes at DC 3.3V)
                     Buzzer − ──── GND
 
-9V Krona → LDO IN
-LDO 3.3V → ESP32 VIN, DHT11 VCC
-LDO GND  → GND
+9V "Krona" :) → LDO IN
+LDO 3.3V      → ESP32 VIN, DHT11 VCC
+LDO GND       → GND
 
-Unlike ESP8266, ESP32 does NOT need GPIO16→RST for deep sleep!
+Unlike ESP8266, ESP32 does NOT need GPIO16→RST for deep sleep!!!
 The RTC timer wakes the chip internally.
 ```
 
@@ -57,6 +72,19 @@ If using a full DevKit board (not bare ESP32 module), the onboard AMS1117
 and USB-UART chip add ~10–20 mA quiescent draw. For long battery life,
 use a bare ESP32-WROOM module with MCP1700.
 
+or 
+
+Bypass the regulator completely
+
+ESP32 DevKit or Arduino DevBoard and a 3.3V pin
+You can:
+ - DO NOT supply power to VIN
+ - DO NOT use USB
+ - Supply a stable 3.3V directly to the 3.3V pin
+
+Then the AMS1117 is not involved.
+This is the most convenient method.
+
 ---
 
 ## Project Structure
@@ -64,17 +92,14 @@ use a bare ESP32-WROOM module with MCP1700.
 ```
 pipe_monitor/
 ├── CMakeLists.txt              ← top-level (required by IDF)
-├── partitions.csv              ← custom partition table with SPIFFS
+├── partitions_custom.csv       ← custom partition table with SPIFFS
 ├── sdkconfig.defaults          ← CPU=80MHz, WiFi off, power management
 ├── main/
-│   ├── CMakeLists.txt          ← registers main.c with build system
-│   ├── config.h                ← ALL tunable pins and constants
-│   └── main.c                  ← application logic
-└── components/
-    └── dht/
-        ├── CMakeLists.txt
-        ├── dht.h
-        └── dht.c               ← DHT11/DHT22 bit-bang driver
+    ├── CMakeLists.txt          ← registers main.c with build system
+    ├── config.h                ← ALL tunable pins and constants
+    ├── main.c                  ← application logic
+    ├── dht.h
+    └── dht.c                   ← DHT11/DHT22 bit-bang driver
 ```
 
 ---

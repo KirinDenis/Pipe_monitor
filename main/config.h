@@ -78,4 +78,4 @@
 #define BUZZER_BEEP_COUNT    5      /* beeps when pipe becomes hot           */
 #define BUZZER_ON_MS       120      /* beep duration, ms                     */
 #define BUZZER_OFF_MS      180      /* silence between beeps, ms             */
-#define LED_VISIBLE_MS    3000      /* keep LED on after buzzer sequence, ms */
+#define LED_VISIBLE_MS   5 * 60 * 1000      /* keep LED on after buzzer sequence, ms */
