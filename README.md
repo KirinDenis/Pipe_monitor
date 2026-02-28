@@ -32,6 +32,7 @@ you see this error at "Monitor Device":
 E (409) SPIFFS: spiffs partition could not be found
 E (409) pipe_monitor: SPIFFS: ESP_ERR_NOT_FOUND
 E (409) pipe_monitor: SPIFFS failed — going back to sleep
+
 ---
 
 ## Wiring
