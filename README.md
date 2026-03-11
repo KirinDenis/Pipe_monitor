@@ -4,6 +4,8 @@ Monitors a hot-water supply pipe, stores 7 days of temperature history,
 and alerts (LED + buzzer) when the pipe is carrying genuinely hot water.
 Detection is adaptive — no manual calibration needed.
 
+<img width="50%" height="50%" alt="image" src="[https://github.com/KirinDenis/ImageClusterizer/blob/main/Screen/logo.png](https://github.com/KirinDenis/Pipe_monitor/blob/main/image1.jpg)" />
+
 ---
 
 ## Quick Start
